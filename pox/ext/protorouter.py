@@ -30,8 +30,6 @@ PUBLIC_PORT = 1
 NAT_PORT_MIN = 40000
 NAT_PORT_MAX = 60000
 
-H1_MAC = EthAddr("00:00:00:00:00:01")  # TODO: resolver mediante ARP.
-
 
 class ProtoRouter(object):
     def __init__(self, connection):
@@ -40,6 +38,9 @@ class ProtoRouter(object):
         self.nat_out = {}
         self.used_nat_ports = set()
         self.next_nat_port = NAT_PORT_MIN
+        self.public_arp = {}
+        self.pending_packets = {}
+        self.arp_requests_in_progress = set()
         connection.addListeners(self)
 
     def _handle_PacketIn(self, event):
@@ -161,6 +162,21 @@ class ProtoRouter(object):
                 f"{PUBLIC_IP}:{nat_port}",
             )
 
+        remote_mac = self.get_public_mac(translation["remote_ip"])
+        if remote_mac is None:
+            self.queue_pending_packet(
+                translation["remote_ip"],
+                translation,
+                event.ofp.data,
+            )
+            log_color(
+                YELLOW,
+                f"PAQUETE EN ESPERA: resolviendo {translation['remote_ip']}",
+            )
+            return
+
+        translation["remote_mac"] = remote_mac
+
         # Se instalan ambos sentidos cuando se crea o recupera la traduccion.
         self.install_incoming_flow(translation)
         self.install_outgoing_flow(translation, event.ofp)
@@ -188,6 +204,75 @@ class ProtoRouter(object):
                 return nat_port
 
         return None
+
+    def get_public_mac(self, target_ip):
+        mac = self.public_arp.get(target_ip)
+
+        if mac is None and target_ip not in self.arp_requests_in_progress:
+            self.arp_requests_in_progress.add(target_ip)
+            self.send_public_arp_request(target_ip)
+
+        return mac
+
+    def send_public_arp_request(self, target_ip):
+        arp_request = arp()
+        arp_request.opcode = arp.REQUEST
+        arp_request.hwsrc = PUBLIC_MAC
+        arp_request.hwdst = EthAddr("00:00:00:00:00:00")
+        arp_request.protosrc = PUBLIC_IP
+        arp_request.protodst = target_ip
+
+        ethernet_request = ethernet()
+        ethernet_request.type = ethernet.ARP_TYPE
+        ethernet_request.src = PUBLIC_MAC
+        ethernet_request.dst = EthAddr("ff:ff:ff:ff:ff:ff")
+        ethernet_request.payload = arp_request
+
+        msg = of.ofp_packet_out()
+        msg.data = ethernet_request.pack()
+        msg.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
+        self.connection.send(msg)
+
+        log_color(YELLOW, f"ARP REQUEST PUBLICO: quien tiene {target_ip}?")
+
+    def queue_pending_packet(self, target_ip, translation, packet_data):
+        pending = self.pending_packets.setdefault(target_ip, [])
+        pending.append(
+            {
+                "translation": translation,
+                "packet_data": packet_data,
+            }
+        )
+
+    def process_pending_packets(self, target_ip, target_mac):
+        pending = self.pending_packets.pop(target_ip, [])
+
+        for item in pending:
+            translation = item["translation"]
+            translation["remote_mac"] = target_mac
+
+            self.install_incoming_flow(translation)
+            self.install_outgoing_flow(translation)
+            self.send_outgoing_packet(translation, item["packet_data"])
+
+    def add_outgoing_actions(self, message, translation):
+        message.actions.append(
+            of.ofp_action_nw_addr.set_src(translation["public_ip"])
+        )
+        message.actions.append(
+            of.ofp_action_tp_port.set_src(translation["nat_port"])
+        )
+        message.actions.append(of.ofp_action_dl_addr.set_src(PUBLIC_MAC))
+        message.actions.append(
+            of.ofp_action_dl_addr.set_dst(translation["remote_mac"])
+        )
+        message.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
+
+    def send_outgoing_packet(self, translation, packet_data):
+        msg = of.ofp_packet_out()
+        msg.data = packet_data
+        self.add_outgoing_actions(msg, translation)
+        self.connection.send(msg)
 
     def install_incoming_flow(self, translation, packet_in=None):
         fm_in = of.ofp_flow_mod()
@@ -230,15 +315,7 @@ class ProtoRouter(object):
         fm_out.match.tp_src = translation["private_port"]
         fm_out.match.tp_dst = translation["remote_port"]
 
-        fm_out.actions.append(
-            of.ofp_action_nw_addr.set_src(translation["public_ip"])
-        )
-        fm_out.actions.append(
-            of.ofp_action_tp_port.set_src(translation["nat_port"])
-        )
-        fm_out.actions.append(of.ofp_action_dl_addr.set_src(PUBLIC_MAC))
-        fm_out.actions.append(of.ofp_action_dl_addr.set_dst(H1_MAC))
-        fm_out.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
+        self.add_outgoing_actions(fm_out, translation)
 
         if packet_in is not None:
             fm_out.data = packet_in
@@ -281,6 +358,20 @@ class ProtoRouter(object):
 
             self.connection.send(msg)
             log_color(GREEN, f"ARP REPLY: {reply_ip} esta en {reply_mac}")
+
+        elif (
+            arp_packet.opcode == arp.REPLY
+            and event.port == PUBLIC_PORT
+            and arp_packet.protodst == PUBLIC_IP
+        ):
+            target_ip = arp_packet.protosrc
+            target_mac = arp_packet.hwsrc
+
+            self.public_arp[target_ip] = target_mac
+            self.arp_requests_in_progress.discard(target_ip)
+
+            log_color(GREEN, f"ARP APRENDIDO: {target_ip} esta en {target_mac}")
+            self.process_pending_packets(target_ip, target_mac)
 
 
 def launch():
