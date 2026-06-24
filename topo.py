@@ -15,24 +15,24 @@ class NATTopo(Topo):
         # Host Público
         h1 = self.addHost(
             "h1",
-            ip="200.0.0.1/24",
-            mac="00:00:00:00:00:01",
+            ip="200.0.0.2/24",
+            mac="00:00:00:00:00:04",
             defaultRoute="via 200.0.0.254",
         )
 
         # Host Privadp
         h2 = self.addHost(
             "h2",
-            ip="192.168.1.2/24",
-            mac="00:00:00:00:00:02",
+            ip="192.168.1.3/24",
+            mac="00:00:00:00:00:06",
             defaultRoute="via 192.168.1.254",
         )
 
         # Host privado
         h3 = self.addHost(
             "h3",
-            ip="192.168.1.3/24",
-            mac="00:00:00:00:00:03",
+            ip="192.168.1.4/24",
+            mac="00:00:00:00:00:05",
             defaultRoute="via 192.168.1.254",
         )
 

@@ -83,3 +83,11 @@ en la tercer terminal puedo hacer
 sudo ovs-ofctl dump-flows s1
 
 para ver estado de los flujos
+
+
+- test comunicacion entre privados (tcp)
+en h2
+iperf -s 
+
+en h3
+iperf -c 192.168.1.2
