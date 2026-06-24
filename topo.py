@@ -12,7 +12,7 @@ class NATTopo(Topo):
     def build(self):
         s1 = self.addSwitch("s1")
 
-        # Red Pública
+        # Host Público
         h1 = self.addHost(
             "h1",
             ip="200.0.0.1/24",
@@ -20,7 +20,7 @@ class NATTopo(Topo):
             defaultRoute="via 200.0.0.254",
         )
 
-        # Red Privada
+        # Host Privadp
         h2 = self.addHost(
             "h2",
             ip="192.168.1.2/24",
