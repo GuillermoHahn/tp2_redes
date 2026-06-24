@@ -69,7 +69,7 @@ en h3
 iperf -c 200.0.0.1 -t 20 &
 
 en h3
-iperf -c 200.0.0.1 -t 20&
+iperf -c 200.0.0.1 -t 20 &
 
 Explicación de la implementación
  Durante la demo, cualquiera de los integrantes del grupo podrá ser consultado sobre la implementación. Todos deberán poder explicar:
