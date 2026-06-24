@@ -4,6 +4,8 @@ import pox.openflow.libopenflow_01 as of
 from pox.lib.addresses import EthAddr, IPAddr
 from pox.lib.packet.arp import arp
 from pox.lib.packet.ethernet import ethernet
+from pox.openflow.topology import FlowRemoved
+
 
 log = core.getLogger()
 RED = "\033[31m"
@@ -112,10 +114,13 @@ class ProtoRouter(object):
         if not ip_pkt.srcip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
             log_color(
                 RED,
-                f"DROP: {ip_pkt.srcip} no pertenece a "
-                f"{PRIVATE_SUBNET}/{PRIVATE_MASK}",
+                f"DROP: {ip_pkt.srcip} no pertenece a {PRIVATE_SUBNET}/{PRIVATE_MASK}",
             )
             return
+        if ip_pkt.ttl <= 1:
+            log_color(RED, "DROP: TTL expirado")
+            return
+        ip_pkt.ttl -= 1
 
         private_key = (
             ip_pkt.protocol,
@@ -135,13 +140,13 @@ class ProtoRouter(object):
 
             translation = {
                 "protocol": ip_pkt.protocol,
-                "private_ip": ip_pkt.srcip,
+                "private_ip": IPAddr(ip_pkt.srcip),
                 "private_port": transport_pkt.srcport,
                 "private_mac": packet.src,
                 "private_switch_port": event.port,
-                "public_ip": PUBLIC_IP,
+                "public_ip": IPAddr(PUBLIC_IP),
                 "nat_port": nat_port,
-                "remote_ip": ip_pkt.dstip,
+                "remote_ip": IPAddr(ip_pkt.dstip),
                 "remote_port": transport_pkt.dstport,
             }
 
@@ -167,7 +172,7 @@ class ProtoRouter(object):
             self.queue_pending_packet(
                 translation["remote_ip"],
                 translation,
-                event.ofp.data,
+                packet.pack(),
             )
             log_color(
                 YELLOW,
@@ -177,9 +182,10 @@ class ProtoRouter(object):
 
         translation["remote_mac"] = remote_mac
 
-        # Se instalan ambos sentidos cuando se crea o recupera la traduccion.
         self.install_incoming_flow(translation)
-        self.install_outgoing_flow(translation, event.ofp)
+        self.install_outgoing_flow(translation)
+
+        self.send_outgoing_packet(translation, packet.pack())
 
         log_color(
             GREEN,
@@ -256,16 +262,10 @@ class ProtoRouter(object):
             self.send_outgoing_packet(translation, item["packet_data"])
 
     def add_outgoing_actions(self, message, translation):
-        message.actions.append(
-            of.ofp_action_nw_addr.set_src(translation["public_ip"])
-        )
-        message.actions.append(
-            of.ofp_action_tp_port.set_src(translation["nat_port"])
-        )
+        message.actions.append(of.ofp_action_nw_addr.set_src(translation["public_ip"]))
+        message.actions.append(of.ofp_action_tp_port.set_src(translation["nat_port"]))
         message.actions.append(of.ofp_action_dl_addr.set_src(PUBLIC_MAC))
-        message.actions.append(
-            of.ofp_action_dl_addr.set_dst(translation["remote_mac"])
-        )
+        message.actions.append(of.ofp_action_dl_addr.set_dst(translation["remote_mac"]))
         message.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
 
     def send_outgoing_packet(self, translation, packet_data):
@@ -277,6 +277,8 @@ class ProtoRouter(object):
     def install_incoming_flow(self, translation, packet_in=None):
         fm_in = of.ofp_flow_mod()
         fm_in.idle_timeout = 30
+        # fm_in.hard_timeout = 60
+        fm_in.flags |= of.OFPFF_SEND_FLOW_REM
         fm_in.match.in_port = PUBLIC_PORT
         fm_in.match.dl_type = ethernet.IP_TYPE
         fm_in.match.nw_proto = translation["protocol"]
@@ -285,16 +287,10 @@ class ProtoRouter(object):
         fm_in.match.tp_src = translation["remote_port"]
         fm_in.match.tp_dst = translation["nat_port"]
 
-        fm_in.actions.append(
-            of.ofp_action_nw_addr.set_dst(translation["private_ip"])
-        )
-        fm_in.actions.append(
-            of.ofp_action_tp_port.set_dst(translation["private_port"])
-        )
+        fm_in.actions.append(of.ofp_action_nw_addr.set_dst(translation["private_ip"]))
+        fm_in.actions.append(of.ofp_action_tp_port.set_dst(translation["private_port"]))
         fm_in.actions.append(of.ofp_action_dl_addr.set_src(PRIVATE_MAC))
-        fm_in.actions.append(
-            of.ofp_action_dl_addr.set_dst(translation["private_mac"])
-        )
+        fm_in.actions.append(of.ofp_action_dl_addr.set_dst(translation["private_mac"]))
         fm_in.actions.append(
             of.ofp_action_output(port=translation["private_switch_port"])
         )
@@ -307,6 +303,8 @@ class ProtoRouter(object):
     def install_outgoing_flow(self, translation, packet_in=None):
         fm_out = of.ofp_flow_mod()
         fm_out.idle_timeout = 30
+        # fm_out.hard_timeout = 60
+        fm_out.flags |= of.OFPFF_SEND_FLOW_REM
         fm_out.match.in_port = translation["private_switch_port"]
         fm_out.match.dl_type = ethernet.IP_TYPE
         fm_out.match.nw_proto = translation["protocol"]
@@ -317,25 +315,18 @@ class ProtoRouter(object):
 
         self.add_outgoing_actions(fm_out, translation)
 
-        if packet_in is not None:
-            fm_out.data = packet_in
-
         self.connection.send(fm_out)
 
     def handle_arp(self, event):
         red_packet = event.parsed
         arp_packet = red_packet.payload
 
-        if (
-            arp_packet.opcode == arp.REQUEST
-            and arp_packet.protodst in (PRIVATE_IP, PUBLIC_IP)
+        if arp_packet.opcode == arp.REQUEST and arp_packet.protodst in (
+            PRIVATE_IP,
+            PUBLIC_IP,
         ):
-            reply_mac = (
-                PRIVATE_MAC if arp_packet.protodst == PRIVATE_IP else PUBLIC_MAC
-            )
-            reply_ip = (
-                PRIVATE_IP if arp_packet.protodst == PRIVATE_IP else PUBLIC_IP
-            )
+            reply_mac = PRIVATE_MAC if arp_packet.protodst == PRIVATE_IP else PUBLIC_MAC
+            reply_ip = PRIVATE_IP if arp_packet.protodst == PRIVATE_IP else PUBLIC_IP
 
             arp_response = arp()
             arp_response.opcode = arp.REPLY
@@ -373,10 +364,83 @@ class ProtoRouter(object):
             log_color(GREEN, f"ARP APRENDIDO: {target_ip} esta en {target_mac}")
             self.process_pending_packets(target_ip, target_mac)
 
+    def _handle_flow_removal(self, event):
+
+        ofp = event.ofp
+
+        if ofp.reason != of.OFPRR_IDLE_TIMEOUT:
+            return
+
+        match = ofp.match
+
+        keys_to_delete = []
+        port_to_free = None
+        protocol_to_free = None
+
+        for key, translation in list(self.nat_out.items()):
+            if (
+                translation["private_ip"] == match.nw_src
+                and translation["private_port"] == match.tp_src
+                and translation["protocol"] == match.nw_proto
+            ):
+                keys_to_delete.append(key)
+                port_to_free = translation["nat_port"]
+                protocol_to_free = translation["protocol"]
+                break
+
+            elif (
+                translation["public_ip"] == match.nw_dst
+                and translation["nat_port"] == match.tp_dst
+                and translation["protocol"] == match.nw_proto
+            ):
+                keys_to_delete.append(key)
+                port_to_free = translation["nat_port"]
+                protocol_to_free = translation["protocol"]
+                break
+
+        if keys_to_delete:
+            for key in keys_to_delete:
+                translation = self.nat_out[key]
+
+                public_key = (
+                    translation["protocol"],
+                    translation["remote_ip"],
+                    translation["remote_port"],
+                    translation["public_ip"],
+                    translation["nat_port"],
+                )
+
+                del self.nat_out[key]
+                self.nat_in.pop(public_key, None)
+
+                self.deallocate_nat_port(protocol_to_free, port_to_free)
+
+                log_color(
+                    YELLOW,
+                    f"TIMEOUT: Conexión {translation['private_ip']}:{translation['private_port']} expiró. "
+                    f"Puerto NAT {port_to_free} liberado con éxito.",
+                )
+
+    def deallocate_nat_port(self, protocol, port):
+        port_key = (protocol, port)
+        if port_key in self.used_nat_ports:
+            self.used_nat_ports.remove(port_key)
+
 
 def launch():
+
+    routers = {}
+
     def start_switch(event):
         log_color(YELLOW, f"Iniciando ProtoRouter para Switch {event.connection.dpid}")
-        ProtoRouter(event.connection)
+
+        routers[event.connection.dpid] = ProtoRouter(event.connection)
+
+    def handle_flow_removed(event):
+        router = routers.get(event.connection.dpid)
+        if router:
+            router._handle_flow_removal(event)
 
     core.openflow.addListenerByName("ConnectionUp", start_switch)
+
+    core.openflow.addListenerByName("FlowRemoved", handle_flow_removed)
