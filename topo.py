@@ -15,7 +15,7 @@ class NATTopo(Topo):
         # Host Público
         h1 = self.addHost(
             "h1",
-            ip="200.0.0.2/24",
+            ip="200.0.0.1/24",
             mac="00:00:00:00:00:04",
             defaultRoute="via 200.0.0.254",
         )
